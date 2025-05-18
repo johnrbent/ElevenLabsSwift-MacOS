@@ -582,7 +582,7 @@ public class ElevenLabsSDK {
             }
         }
         
-        func processUserAudio(data: Data, frameCount: Int) {
+        public func processUserAudio(data: Data, frameCount: Int) {
             let totalBytes = data.count
             if totalBytes <= Constants.safeMessageSize {
                 let base64String = data.base64EncodedString()
