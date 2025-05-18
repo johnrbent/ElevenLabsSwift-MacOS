@@ -1,6 +1,5 @@
 import AVFoundation
 import Combine
-import DeviceKit
 import Foundation
 import os.log
 
@@ -139,125 +138,6 @@ public class ElevenLabsSDK {
         case handlerNotFound(String)
         case invalidParameters
         case executionFailed(String)
-    }
-
-    // MARK: - Audio Processing
-
-    public class AudioConcatProcessor {
-        private var buffers: [Data] = []
-        private var cursor: Int = 0
-        private var currentBuffer: Data?
-        private var wasInterrupted: Bool = false
-        private var finished: Bool = false
-        public var onProcess: ((Bool) -> Void)?
-
-        public func process(outputs: inout [[Float]]) {
-            var isFinished = false
-            let outputChannel = 0
-            var outputBuffer = outputs[outputChannel]
-            var outputIndex = 0
-
-            while outputIndex < outputBuffer.count {
-                if currentBuffer == nil {
-                    if buffers.isEmpty {
-                        isFinished = true
-                        break
-                    }
-                    currentBuffer = buffers.removeFirst()
-                    cursor = 0
-                }
-
-                if let currentBuffer = currentBuffer {
-                    let remainingSamples = currentBuffer.count / 2 - cursor
-                    let samplesToWrite = min(remainingSamples, outputBuffer.count - outputIndex)
-
-                    guard let int16ChannelData = currentBuffer.withUnsafeBytes({ $0.bindMemory(to: Int16.self).baseAddress }) else {
-                        print("Failed to access Int16 channel data.")
-                        break
-                    }
-
-                    for sampleIndex in 0 ..< samplesToWrite {
-                        let sample = int16ChannelData[cursor + sampleIndex]
-                        outputBuffer[outputIndex] = Float(sample) / 32768.0
-                        outputIndex += 1
-                    }
-
-                    cursor += samplesToWrite
-
-                    if cursor >= currentBuffer.count / 2 {
-                        self.currentBuffer = nil
-                    }
-                }
-            }
-
-            outputs[outputChannel] = outputBuffer
-
-            if finished != isFinished {
-                finished = isFinished
-                onProcess?(isFinished)
-            }
-        }
-
-        public func handleMessage(_ message: [String: Any]) {
-            guard let type = message["type"] as? String else { return }
-
-            switch type {
-            case "buffer":
-                if let buffer = message["buffer"] as? Data {
-                    wasInterrupted = false
-                    buffers.append(buffer)
-                }
-            case "interrupt":
-                wasInterrupted = true
-            case "clearInterrupted":
-                if wasInterrupted {
-                    wasInterrupted = false
-                    buffers.removeAll()
-                    currentBuffer = nil
-                }
-            default:
-                break
-            }
-        }
-    }
-
-    // MARK: - Device Check
-
-    /// Checks if the current device is likely an iPhone 13 or older model using DeviceKit.
-    private static func isOlderDeviceModel_DeviceKit() -> Bool {
-        let currentDevice = Device.current
-        let logger = Logger(subsystem: "com.elevenlabs.ElevenLabsSDK", category: "DeviceCheck")
-
-        // Define the array of older iPhone models (up to iPhone 13 series)
-        // Note: This array might need updates if DeviceKit adds more specific older models or you need to support very old ones.
-        let olderModels: [Device] = [
-            // iPhone 13 Series
-            .iPhone13, .iPhone13Mini, .iPhone13Pro, .iPhone13ProMax,
-            // iPhone SE Series (relevant generations)
-            .iPhoneSE2, .iPhoneSE3, // Assuming SE 2/3 fall under 'older'
-            // iPhone 12 Series
-            .iPhone12, .iPhone12Mini, .iPhone12Pro, .iPhone12ProMax,
-            // iPhone 11 Series
-            .iPhone11, .iPhone11Pro, .iPhone11ProMax,
-            // iPhone X Series
-            .iPhoneX, .iPhoneXR, .iPhoneXS, .iPhoneXSMax,
-            // iPhone 8 Series
-            .iPhone8, .iPhone8Plus,
-            // iPhone 7 Series
-            .iPhone7, .iPhone7Plus,
-            // Older SE
-            .iPhoneSE,
-            // Add older models here if needed (e.g., .iPhone6s, .iPhone6sPlus, etc.)
-        ]
-
-        if currentDevice.isPhone && olderModels.contains(currentDevice) {
-            logger.debug("DeviceKit check: Detected older iPhone model (\(currentDevice.description)). Applying workaround.")
-            return true
-        }
-
-        // Covers iPhone 14 series and newer, iPads, iPods, Simulators, unknown devices.
-        logger.debug("DeviceKit check: Detected newer iPhone model (\(currentDevice.description)) or non-applicable device. No workaround needed.")
-        return false
     }
 
     // MARK: - Connection
@@ -403,242 +283,7 @@ public class ElevenLabsSDK {
             socket.cancel(with: .goingAway, reason: nil)
         }
     }
-
-    // MARK: - Audio Input
-
-    public class Input {
-        public let audioUnit: AudioUnit
-        public var audioFormat: AudioStreamBasicDescription
-        public var isRecording: Bool = false
-        private var recordCallback: ((AVAudioPCMBuffer, Float) -> Void)?
-        private var currentAudioLevel: Float = 0.0
-
-        private init(audioUnit: AudioUnit, audioFormat: AudioStreamBasicDescription) {
-            self.audioUnit = audioUnit
-            self.audioFormat = audioFormat
-        }
-
-        public static func create(sampleRate: Double) async throws -> Input {
-            // Define the Audio Component
-            var audioComponentDesc = AudioComponentDescription(
-                componentType: kAudioUnitType_Output,
-                componentSubType: kAudioUnitSubType_VoiceProcessingIO, // For echo cancellation
-                componentManufacturer: kAudioUnitManufacturer_Apple,
-                componentFlags: 0,
-                componentFlagsMask: 0
-            )
-
-            guard let audioComponent = AudioComponentFindNext(nil, &audioComponentDesc) else {
-                throw ElevenLabsError.failedToCreateAudioComponent
-            }
-
-            var audioUnitOptional: AudioUnit?
-            AudioComponentInstanceNew(audioComponent, &audioUnitOptional)
-            guard let audioUnit = audioUnitOptional else {
-                throw ElevenLabsError.failedToCreateAudioComponentInstance
-            }
-
-            // Create the Input instance
-            let input = Input(audioUnit: audioUnit, audioFormat: AudioStreamBasicDescription())
-
-            // Enable IO for recording
-            var enableIO: UInt32 = 1
-            AudioUnitSetProperty(audioUnit,
-                                 kAudioOutputUnitProperty_EnableIO,
-                                 kAudioUnitScope_Input,
-                                 1,
-                                 &enableIO,
-                                 UInt32(MemoryLayout.size(ofValue: enableIO)))
-
-            // Disable output
-            var disableIO: UInt32 = 0
-            AudioUnitSetProperty(audioUnit,
-                                 kAudioOutputUnitProperty_EnableIO,
-                                 kAudioUnitScope_Output,
-                                 0,
-                                 &disableIO,
-                                 UInt32(MemoryLayout.size(ofValue: disableIO)))
-
-            // Set the audio format
-            var audioFormat = AudioStreamBasicDescription(
-                mSampleRate: sampleRate,
-                mFormatID: kAudioFormatLinearPCM,
-                mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-                mBytesPerPacket: 2,
-                mFramesPerPacket: 1,
-                mBytesPerFrame: 2,
-                mChannelsPerFrame: 1,
-                mBitsPerChannel: 16,
-                mReserved: 0
-            )
-
-            AudioUnitSetProperty(audioUnit,
-                                 kAudioUnitProperty_StreamFormat,
-                                 kAudioUnitScope_Output,
-                                 1, // Bus 1 (Output scope of input element)
-                                 &audioFormat,
-                                 UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
-
-            input.audioFormat = audioFormat
-
-            // Set the input callback
-            var inputCallbackStruct = AURenderCallbackStruct(
-                inputProc: inputRenderCallback,
-                inputProcRefCon: UnsafeMutableRawPointer(Unmanaged.passUnretained(input).toOpaque())
-            )
-            AudioUnitSetProperty(audioUnit,
-                                 kAudioOutputUnitProperty_SetInputCallback,
-                                 kAudioUnitScope_Global,
-                                 1, // Bus 1
-                                 &inputCallbackStruct,
-                                 UInt32(MemoryLayout<AURenderCallbackStruct>.size))
-
-            // Initialize and start the audio unit
-            AudioUnitInitialize(audioUnit)
-            AudioOutputUnitStart(audioUnit)
-
-            return input
-        }
-
-        public func setRecordCallback(_ callback: @escaping (AVAudioPCMBuffer, Float) -> Void) {
-            recordCallback = callback
-        }
-
-        public func close() {
-            AudioOutputUnitStop(audioUnit)
-            AudioUnitUninitialize(audioUnit)
-            AudioComponentInstanceDispose(audioUnit)
-        }
-
-        private static let inputRenderCallback: AURenderCallback = {
-            inRefCon,
-                ioActionFlags,
-                inTimeStamp,
-                _,
-                inNumberFrames,
-                _
-                -> OSStatus in
-            let input = Unmanaged<Input>.fromOpaque(inRefCon).takeUnretainedValue()
-            let audioUnit = input.audioUnit
-
-            let byteSize = Int(inNumberFrames) * MemoryLayout<Int16>.size
-            let data = UnsafeMutableRawPointer.allocate(byteCount: byteSize, alignment: MemoryLayout<Int16>.alignment)
-            var audioBuffer = AudioBuffer(
-                mNumberChannels: 1,
-                mDataByteSize: UInt32(byteSize),
-                mData: data
-            )
-            var bufferList = AudioBufferList(
-                mNumberBuffers: 1,
-                mBuffers: audioBuffer
-            )
-
-            let status = AudioUnitRender(audioUnit,
-                                         ioActionFlags,
-                                         inTimeStamp,
-                                         1, // inBusNumber
-                                         inNumberFrames,
-                                         &bufferList)
-
-            if status == noErr {
-                let frameCount = Int(inNumberFrames)
-                guard let audioFormat = AVAudioFormat(
-                    commonFormat: .pcmFormatInt16,
-                    sampleRate: input.audioFormat.mSampleRate,
-                    channels: 1,
-                    interleaved: true
-                ) else {
-                    data.deallocate()
-                    return noErr
-                }
-                guard let pcmBuffer = AVAudioPCMBuffer(
-                    pcmFormat: audioFormat,
-                    frameCapacity: AVAudioFrameCount(frameCount)
-                ) else {
-                    data.deallocate()
-                    return noErr
-                }
-                pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
-                let dataPointer = data.assumingMemoryBound(to: Int16.self)
-                if let channelData = pcmBuffer.int16ChannelData {
-                    memcpy(channelData[0], dataPointer, byteSize)
-                }
-
-                // Compute RMS value for volume level
-                var rms: Float = 0.0
-                for i in 0 ..< frameCount {
-                    let sample = Float(dataPointer[i]) / Float(Int16.max)
-                    rms += sample * sample
-                }
-                rms = sqrt(rms / Float(frameCount))
-
-                // Call the callback with the audio buffer and current audio level
-                input.recordCallback?(pcmBuffer, rms)
-            }
-
-            data.deallocate()
-            return status
-        }
-    }
-
-    // MARK: - Output
-
-    public class Output {
-        public let engine: AVAudioEngine
-        public let playerNode: AVAudioPlayerNode
-        public let mixer: AVAudioMixerNode
-        let audioQueue: DispatchQueue
-        let audioFormat: AVAudioFormat
-
-        private init(engine: AVAudioEngine, playerNode: AVAudioPlayerNode, mixer: AVAudioMixerNode, audioFormat: AVAudioFormat) {
-            self.engine = engine
-            self.playerNode = playerNode
-            self.mixer = mixer
-            self.audioFormat = audioFormat
-            audioQueue = DispatchQueue(label: "com.elevenlabs.audioQueue", qos: .userInteractive)
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleInterruption),
-                name: .AVAudioEngineConfigurationChange,
-                object: engine
-            )
-        }
-
-        public static func create(sampleRate: Double) async throws -> Output {
-            let engine = AVAudioEngine()
-            let playerNode = AVAudioPlayerNode()
-            let mixer = AVAudioMixerNode()
-
-            engine.attach(playerNode)
-            engine.attach(mixer)
-
-            guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false) else {
-                throw ElevenLabsError.failedToCreateAudioFormat
-            }
-            engine.connect(playerNode, to: mixer, format: format)
-            engine.connect(mixer, to: engine.mainMixerNode, format: format)
-
-            return Output(engine: engine, playerNode: playerNode, mixer: mixer, audioFormat: format)
-        }
-
-        public func close() {
-            engine.stop()
-            // see AVAudioEngine documentation
-            playerNode.stop()
-        }
-
-        public func startPlaying() throws {
-            try engine.start()
-            playerNode.play()
-        }
-
-        @objc private func handleInterruption() throws {
-            engine.connect(playerNode, to: mixer, format: audioFormat)
-            engine.connect(mixer, to: engine.mainMixerNode, format: audioFormat)
-            try startPlaying()
-        }
-    }
-
+    
     // MARK: - Conversation
 
     public enum Role: String {
@@ -663,33 +308,26 @@ public class ElevenLabsSDK {
         public var onDisconnect: @Sendable () -> Void = {}
         public var onMessage: @Sendable (String, Role) -> Void = { _, _ in }
         public var onError: @Sendable (String, Any?) -> Void = { _, _ in }
+        public var onAudioEvent: @Sendable (Data) -> Void = { _ in }
+        public var onInterruption: @Sendable () -> Void = {}
         public var onStatusChange: @Sendable (Status) -> Void = { _ in }
         public var onModeChange: @Sendable (Mode) -> Void = { _ in }
-        public var onVolumeUpdate: @Sendable (Float) -> Void = { _ in }
 
         public init() {}
     }
 
     public class Conversation: @unchecked Sendable {
         private let connection: Connection
-        private let input: Input
-        private let output: Output
         private let callbacks: Callbacks
         private let clientTools: ClientTools?
 
         private let modeLock = NSLock()
         private let statusLock = NSLock()
-        private let volumeLock = NSLock()
         private let lastInterruptTimestampLock = NSLock()
         private let isProcessingInputLock = NSLock()
 
-        private var inputVolumeUpdateTimer: Timer?
-        private let inputVolumeUpdateInterval: TimeInterval = 0.1 // Update every 100ms
-        private var currentInputVolume: Float = 0.0
-
         private var _mode: Mode = .listening
         private var _status: Status = .connecting
-        private var _volume: Float = 1.0
         private var _lastInterruptTimestamp: Int = 0
         private var _isProcessingInput: Bool = true
 
@@ -703,11 +341,6 @@ public class ElevenLabsSDK {
             set { statusLock.withLock { _status = newValue } }
         }
 
-        private var volume: Float {
-            get { volumeLock.withLock { _volume } }
-            set { volumeLock.withLock { _volume = newValue } }
-        }
-
         private var lastInterruptTimestamp: Int {
             get { lastInterruptTimestampLock.withLock { _lastInterruptTimestamp } }
             set { lastInterruptTimestampLock.withLock { _lastInterruptTimestamp = newValue } }
@@ -718,72 +351,14 @@ public class ElevenLabsSDK {
             set { isProcessingInputLock.withLock { _isProcessingInput = newValue } }
         }
 
-        private var audioBuffers: [AVAudioPCMBuffer] = []
-        private let audioBufferLock = NSLock()
-
-        private var previousSamples: [Int16] = Array(repeating: 0, count: 10)
-        private var isFirstBuffer = true
-
-        private let audioConcatProcessor = ElevenLabsSDK.AudioConcatProcessor()
-        private var outputBuffers: [[Float]] = [[]]
-
         private let logger = Logger(subsystem: "com.elevenlabs.ElevenLabsSDK", category: "Conversation")
 
-        private func setupInputVolumeMonitoring() {
-            DispatchQueue.main.async {
-                self.inputVolumeUpdateTimer = Timer.scheduledTimer(withTimeInterval: self.inputVolumeUpdateInterval, repeats: true) { [weak self] _ in
-                    guard let self = self else { return }
-                    self.callbacks.onVolumeUpdate(self.currentInputVolume)
-                }
-            }
-        }
-
-        private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-            guard let channelData = buffer.floatChannelData else {
-                return
-            }
-
-            var sumOfSquares: Float = 0
-            let channelCount = Int(buffer.format.channelCount)
-            let frameLength = Int(buffer.frameLength) // Convert to Int
-
-            for channel in 0 ..< channelCount {
-                let data = channelData[channel]
-                for i in 0 ..< frameLength {
-                    sumOfSquares += data[i] * data[i]
-                }
-            }
-
-            let rms = sqrt(sumOfSquares / Float(frameLength * channelCount))
-            let meterLevel = rms > 0 ? 20 * log10(rms) : -50.0 // Safeguarded
-
-            // Normalize the meter level to a 0-1 range
-            let normalizedLevel = max(0, min(1, (meterLevel + 50) / 50))
-
-            // Call the callback with the volume level
-            DispatchQueue.main.async {
-                self.callbacks.onVolumeUpdate(normalizedLevel)
-            }
-        }
-
-        private init(connection: Connection, input: Input, output: Output, callbacks: Callbacks, clientTools: ClientTools?) {
+        private init(connection: Connection, callbacks: Callbacks, clientTools: ClientTools?) {
             self.connection = connection
-            self.input = input
-            self.output = output
             self.callbacks = callbacks
             self.clientTools = clientTools
 
-            // Set the onProcess callback
-            audioConcatProcessor.onProcess = { [weak self] finished in
-                guard let self = self else { return }
-                if finished {
-                    self.updateMode(.listening)
-                }
-            }
-
             setupWebSocket()
-            setupAudioProcessing()
-            setupInputVolumeMonitoring()
         }
 
         /// Starts a new conversation session
@@ -793,45 +368,11 @@ public class ElevenLabsSDK {
         ///   - clientTools: Client tools callbacks (optional)
         /// - Returns: A started `Conversation` instance
         public static func startSession(config: SessionConfig, callbacks: Callbacks = Callbacks(), clientTools: ClientTools? = nil) async throws -> Conversation {
-            // Step 1: Configure the audio session
-            try ElevenLabsSDK.configureAudioSession()
-
-            // Step 2: Create the WebSocket connection
+            // Step 1: Create the WebSocket connection
             let connection = try await Connection.create(config: config)
 
-            // Step 3: Create the audio input
-            let input = try await Input.create(sampleRate: Constants.inputSampleRate)
-
-            // Step 4: Create the audio output
-            let output = try await Output.create(sampleRate: Double(connection.sampleRate))
-
-            // Step 5: Initialize the Conversation
-            let conversation = Conversation(connection: connection, input: input, output: output, callbacks: callbacks, clientTools: clientTools)
-
-            // Step 6: Start playing audio (implicitly activates session and engine)
-            try output.startPlaying()
-            conversation.logger.info("Audio engine started.")
-
-            // Step 6.5: Apply speaker output override for older devices
-            if isOlderDeviceModel_DeviceKit() { // Use the new DeviceKit-based check
-                conversation.logger.info("Applying speaker override for older device model.")
-                // Dispatch after a short delay to ensure session/engine are fully ready
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { // 0.5s delay, adjust if needed
-                    do {
-                        try AVAudioSession.sharedInstance().overrideOutputAudioPort(.speaker)
-                        conversation.logger.info("Successfully overridden output audio port to speaker.")
-                    } catch {
-                        conversation.logger.error("Failed to override output audio port to speaker: \(error.localizedDescription)")
-                        // Optionally trigger onError callback
-                        // conversation.callbacks.onError("Failed to set speaker output", error)
-                    }
-                }
-            } else {
-                conversation.logger.info("Speaker override not needed for this device model.")
-            }
-
-            // Step 7: Start recording
-            conversation.startRecording()
+            // Step 2: Initialize the Conversation
+            let conversation = Conversation(connection: connection, callbacks: callbacks, clientTools: clientTools)
 
             return conversation
         }
@@ -867,16 +408,6 @@ public class ElevenLabsSDK {
                 if self.status == .connected {
                     self.receiveMessages()
                 }
-            }
-        }
-
-        public var conversationVolume: Float {
-            get {
-                return volume
-            }
-            set {
-                volume = newValue
-                output.mixer.volume = newValue
             }
         }
 
@@ -983,11 +514,8 @@ public class ElevenLabsSDK {
                   let eventId = event["event_id"] as? Int else { return }
 
             lastInterruptTimestamp = eventId
-            fadeOutAudio()
-
-            // Clear the audio buffers and stop playback
-            clearAudioBuffers()
-            stopPlayback()
+            updateMode(.listening)
+            callbacks.onInterruption()
         }
 
         private func handleAgentResponseEvent(_ json: [String: Any]) {
@@ -1053,72 +581,31 @@ public class ElevenLabsSDK {
                 }
             }
         }
-
-        private func setupAudioProcessing() {
-            input.setRecordCallback { [weak self] buffer, rms in
-                guard let self = self, self.isProcessingInput else { return }
-
-                // Convert buffer data to base64 string
-                if let int16ChannelData = buffer.int16ChannelData {
-                    let frameLength = Int(buffer.frameLength)
-                    let totalBytes = frameLength * MemoryLayout<Int16>.size
-
-                    // If buffer is small enough, send in one chunk
-                    if totalBytes <= Constants.safeMessageSize {
-                        let data = Data(bytes: int16ChannelData[0], count: totalBytes)
-                        let base64String = data.base64EncodedString()
-                        let message: [String: Any] = ["type": "user_audio_chunk", "user_audio_chunk": base64String]
-                        self.sendWebSocketMessage(message)
-                    } else {
-                        // Split into smaller chunks
-                        let framesPerChunk = Constants.safeMessageSize / MemoryLayout<Int16>.size
-                        var frameOffset = 0
-
-                        while frameOffset < frameLength {
-                            let framesInChunk = min(framesPerChunk, frameLength - frameOffset)
-                            let bytesInChunk = framesInChunk * MemoryLayout<Int16>.size
-
-                            let chunkData = Data(bytes: int16ChannelData[0].advanced(by: frameOffset), count: bytesInChunk)
-                            let base64String = chunkData.base64EncodedString()
-
-                            let message: [String: Any] = ["type": "user_audio_chunk", "user_audio_chunk": base64String]
-                            self.sendWebSocketMessage(message)
-
-                            frameOffset += framesInChunk
-                        }
-                    }
-                } else {
-                    self.logger.error("Failed to get int16 channel data")
-                }
-
-                // Update volume level
-                self.currentInputVolume = rms
-
-                // Notify volume changes
-                DispatchQueue.main.async {
-                    self.callbacks.onVolumeUpdate(rms)
+        
+        func processUserAudio(data: Data, frameCount: Int) {
+            let totalBytes = data.count
+            if totalBytes <= Constants.safeMessageSize {
+                let base64String = data.base64EncodedString()
+                let message: [String: Any] = ["type": "user_audio_chunk", "user_audio_chunk": base64String]
+                self.sendWebSocketMessage(message)
+            } else {
+                // Split into smaller chunks
+                let framesPerChunk = Constants.safeMessageSize / MemoryLayout<Int16>.size
+                var frameOffset = 0
+                
+                while frameOffset < frameCount {
+                    let framesInChunk = min(framesPerChunk, frameCount - frameOffset)
+                    let bytesInChunk = framesInChunk * MemoryLayout<Int16>.size
+                    
+                    let chunkData = data.advanced(by: frameCount).prefix(bytesInChunk)
+                    let base64String = chunkData.base64EncodedString()
+                    
+                    let message: [String: Any] = ["type": "user_audio_chunk", "user_audio_chunk": base64String]
+                    self.sendWebSocketMessage(message)
+                    
+                    frameOffset += framesInChunk
                 }
             }
-        }
-
-        private func updateVolume(_ buffer: AVAudioPCMBuffer) {
-            guard let channelData = buffer.floatChannelData else { return }
-
-            var sum: Float = 0
-            let channelCount = Int(buffer.format.channelCount)
-
-            for channel in 0 ..< channelCount {
-                let data = channelData[channel]
-                for i in 0 ..< Int(buffer.frameLength) {
-                    sum += abs(data[i])
-                }
-            }
-
-            let average = sum / Float(buffer.frameLength * buffer.format.channelCount)
-            let meterLevel = 20 * log10(average)
-
-            // Normalize the meter level to a 0-1 range
-            currentInputVolume = max(0, min(1, (meterLevel + 50) / 50))
         }
 
         private func addAudioBase64Chunk(_ chunk: String) {
@@ -1126,79 +613,7 @@ public class ElevenLabsSDK {
                 callbacks.onError("Failed to decode audio chunk", nil)
                 return
             }
-
-            let sampleRate = Double(connection.sampleRate)
-            guard let audioFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: sampleRate,
-                channels: 1,
-                interleaved: false
-            ) else {
-                callbacks.onError("Failed to create AVAudioFormat", nil)
-                return
-            }
-
-            let frameCount = data.count / MemoryLayout<Int16>.size
-
-            if frameCount > 0 {
-                guard let audioBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
-                    callbacks.onError("Failed to create AVAudioPCMBuffer", nil)
-                    return
-                }
-
-                audioBuffer.frameLength = AVAudioFrameCount(frameCount)
-
-                data.withUnsafeBytes { (int16Buffer: UnsafeRawBufferPointer) in
-                    guard let int16Pointer = int16Buffer.bindMemory(to: Int16.self).baseAddress else { return }
-                    if let floatChannelData = audioBuffer.floatChannelData {
-                        for i in 0 ..< frameCount {
-                            floatChannelData[0][i] = Float(Int16(littleEndian: int16Pointer[i])) / Float(Int16.max)
-                        }
-                    }
-                }
-
-                audioBufferLock.withLock {
-                    audioBuffers.append(audioBuffer)
-                }
-            }
-
-            scheduleNextBuffer()
-        }
-
-        private func scheduleNextBuffer() {
-            output.audioQueue.async { [weak self] in
-                guard let self = self else { return }
-
-                let buffer: AVAudioPCMBuffer? = self.audioBufferLock.withLock {
-                    self.audioBuffers.isEmpty ? nil : self.audioBuffers.removeFirst()
-                }
-
-                guard let audioBuffer = buffer else { return }
-
-                self.output.playerNode.scheduleBuffer(audioBuffer) {
-                    self.scheduleNextBuffer()
-                }
-                if !self.output.playerNode.isPlaying {
-                    self.output.playerNode.play()
-                }
-            }
-        }
-
-        private func fadeOutAudio() {
-            // Mute agent
-            updateMode(.listening)
-
-            // Fade out the volume
-            let fadeOutDuration: TimeInterval = 2.0
-            output.mixer.volume = volume
-            output.mixer.volume = 0.0001
-
-            // Reset volume back after 2 seconds
-            DispatchQueue.main.asyncAfter(deadline: .now() + fadeOutDuration) { [weak self] in
-                guard let self = self else { return }
-                self.output.mixer.volume = self.volume
-                self.clearAudioBuffers()
-            }
+            callbacks.onAudioEvent(data)
         }
 
         private func updateMode(_ newMode: Mode) {
@@ -1228,56 +643,13 @@ public class ElevenLabsSDK {
 
             updateStatus(.disconnecting)
             connection.close()
-            input.close()
-            output.close()
             updateStatus(.disconnected)
-
-            DispatchQueue.main.async {
-                self.inputVolumeUpdateTimer?.invalidate()
-                self.inputVolumeUpdateTimer = nil
-            }
         }
 
         /// Retrieves the conversation ID
         /// - Returns: Conversation identifier
         public func getId() -> String {
             connection.conversationId
-        }
-
-        /// Retrieves the input volume
-        /// - Returns: Current input volume
-        public func getInputVolume() -> Float {
-            0
-        }
-
-        /// Retrieves the output volume
-        /// - Returns: Current output volume
-        public func getOutputVolume() -> Float {
-            output.mixer.volume
-        }
-
-        /// Starts recording audio input
-        public func startRecording() {
-            isProcessingInput = true
-        }
-
-        /// Stops recording audio input
-        public func stopRecording() {
-            isProcessingInput = false
-        }
-
-        private func clearAudioBuffers() {
-            audioBufferLock.withLock {
-                audioBuffers.removeAll()
-            }
-            audioConcatProcessor.handleMessage(["type": "clearInterrupted"])
-        }
-
-        private func stopPlayback() {
-            output.audioQueue.async { [weak self] in
-                guard let self = self else { return }
-                self.output.playerNode.stop()
-            }
         }
     }
 
@@ -1313,44 +685,6 @@ public class ElevenLabsSDK {
             case .unknownMessageType:
                 return "Received an unknown message type."
             }
-        }
-    }
-
-    // MARK: - Audio Session Configuration
-
-    private static func configureAudioSession() throws {
-        let audioSession = AVAudioSession.sharedInstance()
-        let logger = Logger(subsystem: "com.elevenlabs.ElevenLabsSDK", category: "AudioSession")
-
-        do {
-            // ALWAYS configure with .voiceChat initially. The override handles older devices later.
-            let sessionMode: AVAudioSession.Mode = .voiceChat
-            logger.info("Configuring session with category: .playAndRecord, mode: .voiceChat")
-            try audioSession.setCategory(.playAndRecord, mode: sessionMode, options: [.defaultToSpeaker, .allowBluetooth])
-
-            // Keep preferred settings
-            try audioSession.setPreferredIOBufferDuration(Constants.ioBufferDuration)
-            logger.debug("Set preferred IO buffer duration to \(Constants.ioBufferDuration)")
-
-            try audioSession.setPreferredSampleRate(Constants.inputSampleRate)
-            logger.debug("Set preferred sample rate to \(Constants.inputSampleRate)")
-
-            // Set input gain if possible
-            if audioSession.isInputGainSettable {
-                try audioSession.setInputGain(1.0)
-                logger.debug("Set input gain to 1.0")
-            } else {
-                logger.debug("Input gain is not settable.")
-            }
-
-            // Activate the session
-            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-            logger.info("Audio session configured and activated.")
-
-        } catch {
-            logger.error("Failed to configure audio session: \(error.localizedDescription)")
-            print("ElevenLabsSDK: Failed to configure audio session: \(error.localizedDescription)")
-            throw error
         }
     }
 }
