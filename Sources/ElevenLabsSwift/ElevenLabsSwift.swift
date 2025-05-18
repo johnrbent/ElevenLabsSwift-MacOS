@@ -119,7 +119,7 @@ public class ElevenLabsSDK {
 
         public init() {}
 
-        public mutating func register(_ name: String, handler: @escaping @Sendable ClientToolHandler) {
+        public mutating func register(_ name: String, handler: @escaping ClientToolHandler) {
             lock.withLock {
                 tools[name] = handler
             }
